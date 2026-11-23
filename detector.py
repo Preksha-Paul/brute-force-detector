@@ -26,20 +26,31 @@ BOLD = "\033[1m"
 RESET = "\033[0m"
 
 # ---------- Patterns that match lines in an SSH log ----------
-# Example line:
-# Nov 23 10:01:02 server sshd[1234]: Failed password for root from 203.0.113.5 port 22 ssh2
+# Logs can start with two kinds of timestamps:
+#   Classic (older Linux):       Nov 23 10:01:02 server sshd[1234]: Failed password ...
+#   ISO (Ubuntu 24.04 and newer): 2026-11-23T10:01:02.123456+00:00 server sshd[1234]: ...
+TIME = r"^(\w{3}\s+\d+ \d{2}:\d{2}:\d{2}|\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})"
+
 FAILED_PATTERN = re.compile(
-    r"^(\w{3}\s+\d+ \d{2}:\d{2}:\d{2}) .*Failed password for (?:invalid user )?(\S+) from (\S+)"
+    TIME + r"\S* .*Failed password for (?:invalid user )?(\S+) from (\S+)"
 )
 SUCCESS_PATTERN = re.compile(
-    r"^(\w{3}\s+\d+ \d{2}:\d{2}:\d{2}) .*Accepted \w+ for (\S+) from (\S+)"
+    TIME + r"\S* .*Accepted \w+ for (\S+) from (\S+)"
 )
+
+# To save space, log programs squash identical lines together:
+#   Old style: "last message repeated 2 times"           (on its own line)
+#   New style: "message repeated 2 times: [ Failed ... ]" (inside the line)
+LAST_REPEATED = re.compile(r"last message repeated (\d+) times?")
+INLINE_REPEATED = re.compile(r"message repeated (\d+) times?: \[")
 
 
 def parse_time(text):
-    """Turn 'Nov 23 10:01:02' into a datetime we can do math with.
-    SSH logs don't include the year, so we add one (2000 is a leap year,
-    so 'Feb 29' still works)."""
+    """Turn a log timestamp into a datetime we can do math with."""
+    if "T" in text:   # ISO style: 2026-11-23T10:01:02
+        return datetime.strptime(text, "%Y-%m-%dT%H:%M:%S")
+    # Classic style has no year, so we add one (2000 is a leap year,
+    # so 'Feb 29' still works).
     return datetime.strptime(f"2000 {text}", "%Y %b %d %H:%M:%S")
 
 
@@ -47,19 +58,33 @@ def read_log(path):
     """Read the log file and collect failed + successful logins for each IP."""
     failed = {}     # ip -> list of (time, username)
     success = {}    # ip -> list of (time, username)
+    previous = None # the last login event we saw, in case it gets "repeated"
 
     with open(path, encoding="utf-8", errors="ignore") as f:
         for line in f:
-            match = FAILED_PATTERN.search(line)
+            # Old style: "last message repeated 2 times" -> copy the previous event
+            match = LAST_REPEATED.search(line)
             if match:
-                time, user, ip = match.groups()
-                failed.setdefault(ip, []).append((parse_time(time), user))
+                if previous:
+                    target, ip, event = previous
+                    for _ in range(int(match.group(1))):
+                        target[ip].append(event)
                 continue
 
-            match = SUCCESS_PATTERN.search(line)
-            if match:
-                time, user, ip = match.groups()
-                success.setdefault(ip, []).append((parse_time(time), user))
+            # New style: "message repeated 2 times: [ ... ]" -> count it N times
+            match = INLINE_REPEATED.search(line)
+            times_seen = int(match.group(1)) if match else 1
+
+            previous = None
+            for pattern, target in ((FAILED_PATTERN, failed), (SUCCESS_PATTERN, success)):
+                match = pattern.search(line)
+                if match:
+                    time, user, ip = match.groups()
+                    event = (parse_time(time), user)
+                    for _ in range(times_seen):
+                        target.setdefault(ip, []).append(event)
+                    previous = (target, ip, event)
+                    break
 
     return failed, success
 
